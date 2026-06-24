@@ -1,0 +1,62 @@
+image: eclipse-temurin:21-jdk
+
+stages:
+  - test
+  - build
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+variables:
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  GITLAB_MAVEN_URL: "$CI_API_V4_URL/groups/wanderpool/-/packages/maven"
+
+cache:
+  key:
+    files:
+      - gradle/wrapper/gradle-wrapper.properties
+      - build.gradle
+  paths:
+    - .gradle/caches/
+    - .gradle/wrapper/
+  policy: pull-push
+
+before_script:
+  - chmod +x ./gradlew
+  - mkdir -p "$GRADLE_USER_HOME"
+  - |
+    if [ -n "${GITLAB_MAVEN_TOKEN:-}" ]; then
+      printf "gitLabMavenUrl=%s\ngitLabMavenTokenName=%s\ngitLabMavenToken=%s\n" \
+        "$GITLAB_MAVEN_URL" "${GITLAB_MAVEN_TOKEN_NAME:-Private-Token}" "$GITLAB_MAVEN_TOKEN" \
+        > "$GRADLE_USER_HOME/gradle.properties"
+      chmod 600 "$GRADLE_USER_HOME/gradle.properties"
+    fi
+
+test:
+  stage: test
+  interruptible: true
+  script:
+    - ./gradlew --no-daemon clean test -PgitLabMavenUrl="${GITLAB_MAVEN_URL}"
+  artifacts:
+    when: always
+    reports:
+      junit: build/test-results/test/TEST-*.xml
+    paths:
+      - build/reports/tests/test/
+    expire_in: 1 week
+
+build:
+  stage: build
+  interruptible: true
+  needs:
+    - job: test
+  script:
+    - ./gradlew --no-daemon clean bootJar -x test -PgitLabMavenUrl="${GITLAB_MAVEN_URL}"
+  artifacts:
+    when: on_success
+    paths:
+      - build/libs/*.jar
+    expire_in: 1 week

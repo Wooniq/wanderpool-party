@@ -1,0 +1,103 @@
+plugins {
+    id 'java'
+    id 'jacoco'
+    id 'org.springframework.boot'
+    id 'io.spring.dependency-management'
+}
+
+group = 'com.wanderpool'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    def gitLabMavenUrl = findProperty('gitLabMavenUrl')
+    if (gitLabMavenUrl) {
+        maven {
+            name = 'gitLab'
+            url = uri(gitLabMavenUrl)
+            allowInsecureProtocol = true
+            credentials(HttpHeaderCredentials) {
+                name = findProperty('gitLabMavenTokenName') ?: 'Job-Token'
+                value = findProperty('gitLabMavenToken') ?: System.getenv('CI_JOB_TOKEN')
+            }
+            authentication {
+                header(HttpHeaderAuthentication)
+            }
+        }
+    }
+
+    mavenLocal()
+    mavenCentral()
+}
+
+def commonVersion = findProperty('wanderpoolCommonVersion') ?: version
+def grpcContractVersion = findProperty('wanderpoolGrpcContractVersion') ?: version
+def resolveVersion = { propertyName, fallback ->
+    rootProject.ext.has(propertyName) ? rootProject.ext.get(propertyName) : (findProperty(propertyName) ?: fallback)
+}
+def grpcSpringBootStarterVersion = resolveVersion('grpcSpringBootStarterVersion', '3.1.0.RELEASE')
+
+dependencies {
+    implementation "com.wanderpool:common:${commonVersion}"
+    implementation "com.wanderpool:grpc-contract:${grpcContractVersion}"
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    // DB
+    implementation 'org.springframework.boot:spring-boot-starter-data-jdbc'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+    runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'com.mysql:mysql-connector-j'
+    runtimeOnly 'org.postgresql:postgresql'
+
+    // Spring Web
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+
+    // Validation
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // Spring Doc
+    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.16'
+
+    // gRPC
+    implementation "net.devh:grpc-client-spring-boot-starter:${grpcSpringBootStarterVersion}"
+    implementation "net.devh:grpc-server-spring-boot-starter:${grpcSpringBootStarterVersion}"
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testCompileOnly 'org.projectlombok:lombok'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testAnnotationProcessor 'org.projectlombok:lombok'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+jacocoTestReport {
+    dependsOn tasks.named('test')
+    reports {
+        xml.required = true
+        html.required = true
+    }
+}
+
+jacocoTestCoverageVerification {
+    dependsOn tasks.named('test')
+    violationRules {
+        rule {
+            limit {
+                counter = 'LINE'
+                value = 'COVEREDRATIO'
+                minimum = 0.80
+            }
+        }
+    }
+}

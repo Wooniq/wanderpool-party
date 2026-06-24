@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: party
+
+  datasource:
+    url: ${PARTY_DATASOURCE_URL:jdbc:h2:mem:party;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE}
+    username: ${PARTY_DATASOURCE_USERNAME:sa}
+    password: ${PARTY_DATASOURCE_PASSWORD:}
+
+  jpa:
+    hibernate:
+      ddl-auto: ${PARTY_JPA_DDL_AUTO:validate}
+
+server:
+  port: ${PARTY_SERVER_PORT:8083}
+
+party:
+  member-client:
+    type: ${PARTY_MEMBER_CLIENT_TYPE:grpc}
+    timeout-ms: ${PARTY_MEMBER_CLIENT_TIMEOUT_MS:500}
+    internal-token: ${PARTY_MEMBER_CLIENT_INTERNAL_TOKEN:}
+
+grpc:
+  server:
+    port: ${PARTY_GRPC_PORT:9091}
+  client:
+    member-service:
+      address: static://${MEMBER_GRPC_HOST:localhost}:${MEMBER_GRPC_PORT:9093}
+      negotiationType: plaintext
