@@ -1,93 +1,340 @@
 # wanderpool-party
 
+## 1. Overview
+
+`wanderpool-party`는 카풀 모집 도메인의 생명주기를 관리하는 Spring Boot 기반 마이크로서비스입니다.
+
+단순 CRUD 서비스가 아닌, **파티 생성부터 참여, 승인, 운행 완료까지의 도메인 규칙과 데이터 정합성**을 중심으로 설계했습니다.
+
+주요 기능
+
+- Driver만 파티 생성 가능
+- 승객의 파티 참여 요청
+- Driver의 참여 승인/거절
+- 승인 시 현재 탑승 인원 증가
+- 정원 도달 시 자동 모집 종료
+- 참여 취소/거절 시 포인트 환불 이벤트 생성
+- 운행 완료 시 Driver 포인트 적립 이벤트 생성
+
+---
+
+## 2. My Contribution
+
+| 구분 | 내용 |
+|---|---|
+| 역할 | PL, Backend, DevOps |
+| 담당 영역 | Party 도메인 설계, 참여/취소/승인 로직 구현, gRPC 기반 서비스 간 통신, 이벤트 기반 포인트 처리, Jenkins · GitOps 기반 CI/CD 구축 |
+| 주요 고민 | MSA 환경에서 서비스 간 데이터 정합성과 도메인 규칙 유지 |
+
+---
+
+## 3. Architecture
+
+> 전체 시스템 아키텍처
+
+온프레미스 Kubernetes 환경에서 MSA 기반 서비스를 구성했으며,
+Kong API Gateway를 통해 외부 요청을 라우팅하고 서비스별 Database를 분리했습니다.
+
+<img width="5166" height="2529" alt="wanderpool-네트워크 아키텍처 최종본 drawio" src="https://github.com/user-attachments/assets/1c16cfb9-ae77-48d1-96f4-19b0633dd1f6" />
 
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## 4. Tech Stack
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+| Category | Stack |
+|---|---|
+| Language | Java 21 |
+| Framework | Spring Boot, Spring Data JPA |
+| Communication | REST, gRPC |
+| Database | PostgreSQL, Flyway |
+| API Docs | Springdoc OpenAPI (Swagger) |
+| Test | JUnit5, Mockito, JaCoCo |
+| Build | Gradle |
+| Infra | Docker, Kubernetes |
+| CI/CD | Jenkins, GitLab CI, Harbor, Argo CD |
 
-## Add your files
+---
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## 5. Domain Model & ERD
 
+<img width="1893" height="1502" alt="Wanderpool" src="https://github.com/user-attachments/assets/e191f3bb-bfea-4417-9c6c-5a82883b3442" />
+
+### Party
+
+카풀 파티 생성부터 모집, 운행 시작, 완료까지의 생명주기를 관리하는 Aggregate Root입니다.
+
+Party는 출발지, 목적지, 경유지, 일정 정보와 모집 상태를 관리하며, 참여 승인 및 운행 상태 변화에 따라 생명주기를 제어합니다.
+
+| 필드 | 설명 |
+|---|---|
+| driverMemberId | 파티 생성자 |
+| origin | 출발지 정보 |
+| destination | 목적지 정보 |
+| waypoints | 경유지 목록 |
+| departureTime | 출발 시간 |
+| arrivalTime | 도착 예정 시간 |
+| maxPassengers | 최대 모집 인원 |
+| currentPassengers | 현재 승인 인원 |
+| status | RECRUITING, CLOSED, IN_PROGRESS, COMPLETED |
+
+### PartyParticipant
+
+파티 참여 요청과 참여자의 상태 및 탑승 위치 정보를 관리합니다.
+
+| 필드 | 설명 |
+|---|---|
+| memberId | 참여 사용자 |
+| pickupLocation | 픽업 위치 및 좌표 |
+| dropoffLocation | 하차 위치 및 좌표 |
+| pointCost | 참여 비용 |
+| paymentDebited | 포인트 차감 여부 |
+| status | 참여 상태 |
+
+| 상태 | 설명 |
+|---|---|
+| PENDING | 승인 대기 |
+| ACCEPTED | 승인 완료 |
+| REJECTED | 참여 거절 |
+| CANCELLED | 참여 취소 |
+
+### PartyWaypoint
+
+파티 경로상의 경유지 정보를 관리합니다.
+
+| 필드 | 설명 |
+|---|---|
+| partyId | 연결된 파티 |
+| orderIndex | 경유지 순서 |
+| name | 경유지 이름 |
+| latitude | 위도 |
+| longitude | 경도 |
+
+---
+
+## 6. Core Features
+
+### Party Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> RECRUITING
+    RECRUITING --> CLOSED : Full
+    RECRUITING --> IN_PROGRESS : Start
+    CLOSED --> IN_PROGRESS
+    IN_PROGRESS --> COMPLETED
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/wanderpool/wanderpool-party.git
-git branch -M main
-git push -uf origin main
+
+### 주요 기능
+
+- 파티 생성
+- 파티 검색
+- 파티 참여 요청
+- Driver의 참여 요청 승인 / 거절
+- 참여 상태(PENDING → ACCEPTED/REJECTED) 관리
+- 참여 취소
+- 운행 시작
+- 운행 완료
+- Driver 포인트 적립
+- Passenger 포인트 환불
+
+---
+
+## 7. Key Design Decisions
+
+### 7.1 Transaction Strategy
+
+파티 참여, 승인, 취소는 여러 데이터가 함께 변경되는 작업입니다.
+
+하나의 트랜잭션에서 다음 작업을 함께 처리하여 상태 변경과 이벤트 생성의 원자성을 보장했습니다.
+
+- Party 상태 변경
+- PartyParticipant 상태 변경
+- 현재 탑승 인원 변경
+- PointCreditOutbox / PointRefundOutbox 이벤트 저장
+
+---
+
+### 7.2 Event Processing (Outbox Pattern)
+
+포인트 적립 및 환불은 Member 서비스가 담당합니다.
+
+Party 서비스는 파티 상태 변경과 이벤트 저장을 동일한 트랜잭션으로 처리한 뒤,
+Scheduler가 Outbox 이벤트를 조회하여 Member 서비스로 전달하도록 구성했습니다.
+
+이를 통해 외부 서비스 장애가 발생하더라도 이벤트 유실을 방지하고,
+재처리를 통해 데이터 정합성을 유지할 수 있도록 설계했습니다.
+
+```text
+Party Service
+
+@Transactional
+        │
+        ▼
++------------------------+
+| Party 상태 변경        |
+| PartyParticipant 변경  |
+| PointCreditOutbox 저장 |
+| PointRefundOutbox 저장 |
++------------------------+
+        │
+      Commit
+        │
+        ▼
+Outbox Scheduler
+        │
+        ▼
+gRPC
+        │
+        ▼
+Member Service
 ```
 
-## Integrate with your tools
+장점
 
-* [Set up project integrations](https://gitlab.com/wanderpool/wanderpool-party/-/settings/integrations)
+- 도메인 데이터와 이벤트 데이터 정합성 보장
+- 이벤트 발행 실패 시 재시도 가능
+- 외부 서비스 장애 전파 최소화
 
-## Collaborate with your team
+---
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### 7.3 gRPC Communication
 
-## Test and Deploy
+Member, Map 서비스와 내부 통신은 gRPC를 사용했습니다.
 
-Use the built-in continuous integration in GitLab.
+적용 이유
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+- REST 대비 낮은 네트워크 오버헤드
+- Protobuf 기반 계약 관리
+- 타입 안정성 확보
+- 서비스 간 인터페이스 명확화
 
-***
+서비스 간 통신은 Proto 기반 계약을 공유하여 API 변경에 따른 영향 범위를 관리했습니다.
 
-# Editing this README
+| Service | 목적 |
+|---------|------|
+| Member | 사용자 검증 |
+| Member | Driver 권한 검증 |
+| Member | 포인트 처리 |
+| Map | 경로 및 위치 정보 조회 |
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+---
 
-## Suggestions for a good README
+### 7.4 Domain Validation
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+서비스에서 적용한 주요 도메인 규칙입니다.
 
-## Name
-Choose a self-explaining name for your project.
+| Rule | 설명 |
+|------|------|
+| Driver만 파티 생성 가능 | 생성 권한 검증 |
+| 생성자는 자신의 파티 참여 불가 | 도메인 규칙 |
+| 동일 사용자 중복 참여 불가 | 참여 검증 |
+| 모집 인원 초과 불가 | 승인 시 검증 |
+| 마감된 파티 참여 불가 | 상태 기반 검증 |
+| 운행 완료 후 수정 불가 | 상태 기반 검증 |
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+---
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+### 7.5 Exception Handling
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+비즈니스 예외를 명확히 분리하고 `GlobalExceptionHandler`를 통해 일관된 응답 형식을 제공합니다.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+대표 예외 코드
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+- PARTY_NOT_FOUND
+- PARTY_ALREADY_CLOSED
+- DUPLICATED_PARTICIPANT
+- INVALID_PARTY_STATUS
+- DRIVER_ONLY_OPERATION
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+---
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## 8. REST API
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Swagger(OpenAPI)를 기준으로 관리합니다.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+| Method | Endpoint | Description |
+|---------|----------|-------------|
+| GET | `/api/parties` | 출발지, 목적지, 시간, 상태 조건 기반 파티 검색 |
+| GET | `/api/parties/me/created` | 내가 생성한 파티 목록 조회 |
+| GET | `/api/parties/me/joined` | 내가 참여한 파티 목록 조회 |
+| GET | `/api/parties/{partyId}` | 파티 상세 조회 |
+| GET | `/api/parties/{partyId}/participants` | 파티 참여자 목록 조회 |
+| POST | `/api/parties` | 카풀 파티 생성 |
+| POST | `/api/parties/{partyId}/join` | 파티 참여 요청 |
+| POST | `/api/parties/{partyId}/participants/{participantId}/accept` | 참여 요청 승인 |
+| POST | `/api/parties/{partyId}/participants/{participantId}/reject` | 참여 요청 거절 |
+| POST | `/api/parties/{partyId}/in-progress` | 파티 운행 시작 |
+| POST | `/api/parties/{partyId}/complete` | 파티 운행 완료 |
+| DELETE | `/api/parties/{partyId}/participants/{participantId}` | 파티 참여 취소 |
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+---
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## 9. Testing
 
-## License
-For open source projects, say how it is licensed.
+- Unit Test
+- Integration Test
+- Repository Test
+- JaCoCo Coverage Verification
+- gRPC Client Mock Test
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```bash
+./gradlew test
+```
+
+---
+
+## 10. Deployment
+
+```mermaid
+flowchart LR
+
+Git --> Jenkins
+Jenkins --> Test
+Test --> Build
+Build --> Docker
+Docker --> Harbor
+Harbor --> GitOps
+GitOps --> ArgoCD
+ArgoCD --> Kubernetes
+```
+
+---
+
+## 11. Run
+
+### Local
+
+```bash
+./gradlew bootRun
+```
+
+### Test
+
+```bash
+./gradlew test
+```
+
+### Build
+
+```bash
+./gradlew clean build
+```
+
+### Docker
+
+```bash
+docker build -t wanderpool-party .
+```
+
+---
+
+## 12. What I Learned
+
+이 프로젝트를 통해 다음과 같은 내용을 경험했습니다.
+
+- MSA 환경에서 서비스 간 책임 분리
+- gRPC 기반 내부 서비스 통신 설계
+- 이벤트 기반 데이터 처리와 데이터 정합성 확보
+- 트랜잭션 경계 설정 및 도메인 규칙 구현
+- Jenkins · Harbor · Argo CD 기반 GitOps 배포 자동화
