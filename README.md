@@ -49,7 +49,7 @@ Kong API Gateway를 통해 외부 요청을 라우팅하고 서비스별 Databas
 | Communication | REST, gRPC |
 | Database | PostgreSQL, Flyway |
 | API Docs | Springdoc OpenAPI (Swagger) |
-| Test | JUnit5, Mockito, JaCoCo |
+| Test | JUnit5, Mockito, JaCoCo, Testcontainers |
 | Build | Gradle |
 | Infra | Docker, Kubernetes |
 | CI/CD | Jenkins, GitLab CI, Harbor, Argo CD |
@@ -242,10 +242,18 @@ Member, Map 서비스와 내부 통신은 gRPC를 사용했습니다.
 대표 예외 코드
 
 - PARTY_NOT_FOUND
-- PARTY_ALREADY_CLOSED
-- DUPLICATED_PARTICIPANT
-- INVALID_PARTY_STATUS
-- DRIVER_ONLY_OPERATION
+- PARTY_NOT_RECRUITING
+- ALREADY_JOINED
+- INVALID_STATUS_TRANSITION
+- NOT_PARTY_DRIVER
+
+---
+
+### 7.6 Concurrency Control
+
+정원 마감 시점에 여러 참여 승낙 요청이 동시에 들어오면 `currentPassengers`가 정원을 초과해서 카운트될 수 있는 동시성 문제가 있어, `Party`에 `@Version` 컬럼을 추가하고 `party.approval.lock-strategy` 프로퍼티로 낙관적 락(`OPTIMISTIC`, 기본값) / 비관적 락(`PESSIMISTIC`, `SELECT ... FOR UPDATE`) 중 하나를 선택할 수 있게 했습니다.
+
+두 전략의 실제 효과는 Testcontainers 기반 벤치마크(`PartyApprovalLockBenchmarkTest`, 정원 1명 파티에 동시 요청 2/8/32건 × 15라운드)로 직접 측정해서 검증했습니다. 이 과정에서 `PESSIMISTIC` 전략이 실제로는 버전 충돌을 줄이지 못하는 버그를 발견했습니다 — `Party` 엔티티가 락 조회 이전에 다른 코드 경로(`verifyDriver`)에서 락 없이 먼저 영속성 컨텍스트에 로드돼버리면, Hibernate가 이미 관리 중인 엔티티를 이후 락 쿼리 결과로 덮어쓰지 않기 때문에 DB 락은 걸려도 애플리케이션은 stale 상태를 그대로 쓰게 되는 문제였습니다. `Party`에 대한 첫 접근이 락 조회 자체가 되도록 순서를 수정한 뒤 재측정해서, 모든 동시성 구간에서 버전 충돌이 0건이 되는 것을 확인했습니다. 상세 원인 분석과 참고 문서는 [PR #1](https://github.com/Wooniq/wanderpool-party/pull/1)에 정리했습니다.
 
 ---
 
@@ -277,6 +285,7 @@ Swagger(OpenAPI)를 기준으로 관리합니다.
 - Repository Test
 - JaCoCo Coverage Verification
 - gRPC Client Mock Test
+- Concurrency Benchmark Test (Testcontainers + PostgreSQL, 락 전략별 동시 요청 부하 측정)
 
 ```bash
 ./gradlew test
@@ -302,6 +311,28 @@ ArgoCD --> Kubernetes
 ---
 
 ## 11. Run
+
+### Prerequisites
+
+이 서비스는 사내 공통 모듈(`com.wanderpool:common`, `com.wanderpool:grpc-contract`)에 의존합니다. 팀 내부에서는 GitLab Maven Registry에서 자동으로 받아오지만, 외부에서 이 저장소만 클론해서 빌드하는 경우 아래 둘 중 하나가 필요합니다.
+
+- GitLab Maven 접근 권한이 있는 경우: `-PgitLabMavenUrl=<url> -PgitLabMavenToken=<token>` 옵션으로 빌드
+- 없는 경우: [wanderpool-common](https://github.com/Mobility-SW-School-3rd-Cloud/wanderpool-common), [wanderpool-proto](https://github.com/Mobility-SW-School-3rd-Cloud/wanderpool-proto)를 각각 클론해서 `./gradlew publishToMavenLocal`로 로컬 Maven 저장소에 먼저 설치
+
+또한 Java 21 (Gradle 툴체인)이 필요합니다. 기본 프로필은 H2 인메모리 DB로 별도 설정 없이 바로 실행되며, PostgreSQL은 운영 환경 연동 시(datasource 환경변수 재정의) 또는 `PartyApprovalLockBenchmarkTest` 동시성 벤치마크 실행 시(Docker 기반 Testcontainers)에만 필요합니다. 아래 환경변수는 필요 시 재정의할 수 있습니다 (`application.yaml` 기준, 기본값은 괄호 안).
+
+| 환경변수 | 설명 |
+|---|---|
+| `PARTY_SERVER_PORT` | HTTP 서버 포트 (`8083`) |
+| `PARTY_GRPC_PORT` | gRPC 서버 포트 (`9091`) |
+| `PARTY_DATASOURCE_URL` | DB 접속 URL (`jdbc:h2:mem:party`) |
+| `PARTY_DATASOURCE_USERNAME` / `PARTY_DATASOURCE_PASSWORD` | DB 계정 (`sa` / 빈 값) |
+| `PARTY_JPA_DDL_AUTO` | Hibernate DDL 전략 (`validate`) |
+| `PARTY_MEMBER_CLIENT_TYPE` | Member 서비스 연동 방식 (`grpc`) |
+| `PARTY_MEMBER_CLIENT_TIMEOUT_MS` | Member 서비스 호출 타임아웃 ms (`500`) |
+| `PARTY_MEMBER_CLIENT_INTERNAL_TOKEN` | 내부 서비스 간 인증 토큰 |
+| `MEMBER_GRPC_HOST` / `MEMBER_GRPC_PORT` | Member 서비스 gRPC 주소 (`localhost` / `9093`) |
+| `PARTY_APPROVAL_LOCK_STRATEGY` | 참여 승낙 동시성 제어 전략 — `OPTIMISTIC`(기본) / `PESSIMISTIC` |
 
 ### Local
 
