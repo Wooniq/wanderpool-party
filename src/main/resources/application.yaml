@@ -19,6 +19,8 @@ party:
     type: ${PARTY_MEMBER_CLIENT_TYPE:grpc}
     timeout-ms: ${PARTY_MEMBER_CLIENT_TIMEOUT_MS:500}
     internal-token: ${PARTY_MEMBER_CLIENT_INTERNAL_TOKEN:}
+  approval:
+    lock-strategy: ${PARTY_APPROVAL_LOCK_STRATEGY:OPTIMISTIC}
 
 grpc:
   server:

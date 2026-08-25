@@ -56,6 +56,10 @@ public class Party extends BaseTimeEntity {
     /** 현재 참여 인원 (승낙 기준) */
     @Column(nullable = false)
     private Integer currentPassengers = 0;
+    /** 낙관적 락 버전 */
+    @Version
+    @Column(nullable = false)
+    private Long version = 0L;
     // ────────────── 상태 ──────────────
     /** 파티 상태: RECRUITING / CLOSED / IN_PROGRESS / COMPLETED */
     @Enumerated(EnumType.STRING)
