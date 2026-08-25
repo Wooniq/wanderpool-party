@@ -16,6 +16,7 @@ import com.wanderpool.be.party.credit.PointCreditOutbox;
 import com.wanderpool.be.party.credit.PointCreditOutboxRepository;
 import com.wanderpool.be.party.common.apiResponse.code.PartyErrorCode;
 import com.wanderpool.be.party.common.apiResponse.exception.PartyException;
+import com.wanderpool.be.party.common.apiResponse.exception.PartyNotFoundException;
 import com.wanderpool.be.party.refund.PointRefundOutbox;
 import com.wanderpool.be.party.refund.PointRefundOutboxRepository;
 import com.wanderpool.be.party.repository.PartyParticipantRepository;
@@ -36,6 +37,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
@@ -51,6 +53,10 @@ public class PartyService {
     private final PointRefundOutboxRepository pointRefundOutboxRepository;
     private final PointCreditOutboxRepository pointCreditOutboxRepository;
     private final MemberClient memberClient;
+
+    /** 참여 승낙 시 동시성 제어 전략: OPTIMISTIC(기본) | PESSIMISTIC */
+    @Value("${party.approval.lock-strategy:OPTIMISTIC}")
+    private String lockStrategy;
 
     @Transactional
     public PartyCreateResponse createParty(Long driverMemberId, PartyCreateRequest request) {
@@ -204,9 +210,18 @@ public class PartyService {
     @Transactional
     public PartyJoinResponse acceptJoinRequest(Long partyId, Long participantId, Long driverMemberId) {
         PartyParticipant participant = loadParticipant(partyId, participantId);
-        verifyDriver(participant.getParty(), driverMemberId);
 
-        Party party = participant.getParty();
+        // 전략 분기: 비관적이면 락을 걸고 재조회, 낙관적이면 기존 참조 사용.
+        // participant.getParty()를 먼저 건드리면(예: verifyDriver) 그 시점에 락 없이
+        // Party가 영속성 컨텍스트에 로드되어버려서, 뒤이은 findByIdForUpdate가 실제로는
+        // DB 락만 걸고 이미 캐시된(stale) 엔티티를 그대로 반환한다 — 그러면 락을 걸어도
+        // 갱신된 상태를 못 보고 그대로 버전 충돌이 난다. 그래서 락 조회를 다른 Party 접근보다 먼저 해야 한다.
+        Party party = "PESSIMISTIC".equals(lockStrategy)
+                ? partyRepository.findByIdForUpdate(partyId)
+                        .orElseThrow(PartyNotFoundException::new)
+                : participant.getParty();
+        verifyDriver(party, driverMemberId);
+
         if (party.getStatus() != PartyStatus.RECRUITING) {
             throw new PartyException(PartyErrorCode.PARTY_NOT_RECRUITING);
         }
