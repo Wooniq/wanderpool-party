@@ -53,6 +53,13 @@ import org.testcontainers.junit.jupiter.Testcontainers;
  *
  * <p>{@code party.approval.lock-strategy}는 빈 생성 시점에 한 번 주입되므로, 전략을 바꾸려면
  * 반드시 JVM(테스트 프로세스)을 재시작해야 한다 — 같은 실행 안에서 두 전략을 번갈아 테스트할 수 없다.
+ *
+ * <p><b>OPTIMISTIC 재시도(PartyApprovalAttempt)에 대한 캐비어트:</b> 이 벤치마크는 정원 1명
+ * 파티에 최대 32명이 동시에 경쟁하는 "완전 경쟁" 구조라, 재시도해도 이길 수 있는 사람은 처음부터
+ * 1명뿐이다. 즉 이 시나리오에서는 재시도가 패자들의 지연(그리고 CONFLICT 평균 소요시간)만 늘리고
+ * 성공/실패 결과 자체는 바꾸지 못한다. 재시도가 실제로 결과를 바꾸려면, 재시도 도중 다른 참여자의
+ * 취소(cancelParticipation)로 자리가 다시 열리는 시나리오가 필요하다 — 이 테스트는 그런 시나리오를
+ * 다루지 않는다.
  */
 @Testcontainers
 @SpringBootTest(properties = "grpc.server.port=0")

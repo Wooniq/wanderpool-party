@@ -255,6 +255,8 @@ Member, Map 서비스와 내부 통신은 gRPC를 사용했습니다.
 
 두 전략의 실제 효과는 Testcontainers 기반 벤치마크(`PartyApprovalLockBenchmarkTest`, 정원 1명 파티에 동시 요청 2/8/32건 × 15라운드)로 직접 측정해서 검증했습니다. 이 과정에서 `PESSIMISTIC` 전략이 실제로는 버전 충돌을 줄이지 못하는 버그를 발견했습니다 — `Party` 엔티티가 락 조회 이전에 다른 코드 경로(`verifyDriver`)에서 락 없이 먼저 영속성 컨텍스트에 로드돼버리면, Hibernate가 이미 관리 중인 엔티티를 이후 락 쿼리 결과로 덮어쓰지 않기 때문에 DB 락은 걸려도 애플리케이션은 stale 상태를 그대로 쓰게 되는 문제였습니다. `Party`에 대한 첫 접근이 락 조회 자체가 되도록 순서를 수정한 뒤 재측정해서, 모든 동시성 구간에서 버전 충돌이 0건이 되는 것을 확인했습니다. 상세 원인 분석과 참고 문서는 [PR #1](https://github.com/Wooniq/wanderpool-party/pull/1)에 정리했습니다.
 
+`OPTIMISTIC` 전략은 버전 충돌이 나면 그대로 실패하는 대신, `party.approval.max-retries`(기본 3) 회까지 재시도합니다. 재시도는 실패한 트랜잭션의 stale한 영속성 컨텍스트를 재사용하지 않도록 매번 새 트랜잭션(`PartyApprovalAttempt#attempt`, `REQUIRES_NEW`)에서 최신 데이터를 다시 읽어오며, 시도마다 `party.approval.retry-backoff-ms` 기준 선형 증가 + 랜덤 지터를 백오프로 둡니다(동시 재시도가 다시 충돌하는 걸 완화하기 위함). 다만 벤치마크의 정원 1명 완전 경쟁 시나리오에서는 재시도해도 이길 수 있는 요청이 처음부터 1명뿐이라 재시도가 결과(성공/실패)를 바꾸지 못하고 패자들의 지연만 늘립니다 — 재시도가 실제로 의미를 가지려면 대기 중 다른 참여자의 취소로 자리가 다시 열리는 시나리오가 필요합니다.
+
 ---
 
 ## 8. REST API
@@ -333,6 +335,8 @@ ArgoCD --> Kubernetes
 | `PARTY_MEMBER_CLIENT_INTERNAL_TOKEN` | 내부 서비스 간 인증 토큰 |
 | `MEMBER_GRPC_HOST` / `MEMBER_GRPC_PORT` | Member 서비스 gRPC 주소 (`localhost` / `9093`) |
 | `PARTY_APPROVAL_LOCK_STRATEGY` | 참여 승낙 동시성 제어 전략 — `OPTIMISTIC`(기본) / `PESSIMISTIC` |
+| `PARTY_APPROVAL_MAX_RETRIES` | `OPTIMISTIC` 전략에서 버전 충돌 시 재시도 최대 횟수 (`3`, `PESSIMISTIC`에서는 사용 안 함) |
+| `PARTY_APPROVAL_RETRY_BACKOFF_MS` | 재시도 백오프 기준 ms — 선형 증가분 단위 + 지터 상한 (`20`) |
 
 ### Local
 

@@ -21,6 +21,8 @@ party:
     internal-token: ${PARTY_MEMBER_CLIENT_INTERNAL_TOKEN:}
   approval:
     lock-strategy: ${PARTY_APPROVAL_LOCK_STRATEGY:OPTIMISTIC}
+    max-retries: ${PARTY_APPROVAL_MAX_RETRIES:3}
+    retry-backoff-ms: ${PARTY_APPROVAL_RETRY_BACKOFF_MS:20}
 
 grpc:
   server:
