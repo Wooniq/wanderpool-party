@@ -23,6 +23,7 @@ import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -54,12 +55,12 @@ import org.testcontainers.junit.jupiter.Testcontainers;
  * <p>{@code party.approval.lock-strategy}는 빈 생성 시점에 한 번 주입되므로, 전략을 바꾸려면
  * 반드시 JVM(테스트 프로세스)을 재시작해야 한다 — 같은 실행 안에서 두 전략을 번갈아 테스트할 수 없다.
  *
- * <p><b>OPTIMISTIC 재시도(PartyApprovalAttempt)에 대한 캐비어트:</b> 이 벤치마크는 정원 1명
- * 파티에 최대 32명이 동시에 경쟁하는 "완전 경쟁" 구조라, 재시도해도 이길 수 있는 사람은 처음부터
- * 1명뿐이다. 즉 이 시나리오에서는 재시도가 패자들의 지연(그리고 CONFLICT 평균 소요시간)만 늘리고
- * 성공/실패 결과 자체는 바꾸지 못한다. 재시도가 실제로 결과를 바꾸려면, 재시도 도중 다른 참여자의
- * 취소(cancelParticipation)로 자리가 다시 열리는 시나리오가 필요하다 — 이 테스트는 그런 시나리오를
- * 다루지 않는다.
+ * <p><b>OPTIMISTIC 재시도(PartyApprovalAttempt)에 대한 캐비어트:</b> {@link #benchmark(int)}는 정원
+ * 1명 파티에 최대 32명이 동시에 경쟁하는 "완전 경쟁" 구조라, 재시도해도 이길 수 있는 사람은 처음부터
+ * 1명뿐이다. 이 시나리오에서는 {@code hasRemainingCapacity} 체크 덕분에 재시도 자체가 스킵되므로,
+ * 재시도 도입 전과 동일한 실측치가 재현되어야 한다. 재시도가 실제로 성공률을 끌어올리는 case는
+ * {@link #benchmark_withSpareCapacity()}(정원 5명 × 동시 요청 32건)에서 별도로 검증한다 — 정원에
+ * 여유가 있으면 먼저 실패한 요청도 재시도해서 남은 자리를 잡을 수 있기 때문이다.
  */
 @Testcontainers
 @SpringBootTest(properties = "grpc.server.port=0")
@@ -121,20 +122,35 @@ class PartyApprovalLockBenchmarkTest {
 
     @ParameterizedTest(name = "동시 요청 {0}건")
     @ValueSource(ints = {2, 8, 32})
-    @DisplayName("경합 강도별 락 전략 비교 — 성공/실패 분리 집계")
+    @DisplayName("경합 강도별 락 전략 비교 — 성공/실패 분리 집계 (정원 1명 완전 경쟁)")
     void benchmark(int concurrency) throws Exception {
+        runBenchmark(concurrency, 1);
+    }
+
+    /**
+     * 정원에 여유가 있는 경쟁 시나리오. 정원 1명 완전 경쟁과 달리, 먼저 버전 충돌로 실패한 요청도
+     * 재시도 시점에 자리가 남아있으면(최대 4자리까지 더 채워야 하므로) 재시도해서 성공으로 전환될
+     * 수 있다 — hasRemainingCapacity 체크가 재시도를 스킵시키지 않는 경우다.
+     */
+    @Test
+    @DisplayName("경합 강도별 락 전략 비교 — 성공/실패 분리 집계 (정원 5명 × 동시 요청 32건, 여유 경쟁)")
+    void benchmark_withSpareCapacity() throws Exception {
+        runBenchmark(32, 5);
+    }
+
+    private void runBenchmark(int concurrency, int maxPassengers) throws Exception {
         int warmup = 3;
         int rounds = 15;
         List<RoundResult> measured = new ArrayList<>();
 
         for (int r = 0; r < warmup + rounds; r++) {
-            RoundResult roundResult = runRound(concurrency);
+            RoundResult roundResult = runRound(concurrency, maxPassengers);
             if (r >= warmup) {
                 measured.add(roundResult);
             }
         }
 
-        printReport(concurrency, measured);
+        printReport(concurrency, maxPassengers, measured);
 
         long errorCount = measured.stream()
                 .flatMap(round -> round.outcomes().stream())
@@ -145,8 +161,8 @@ class PartyApprovalLockBenchmarkTest {
                 .isZero();
     }
 
-    private RoundResult runRound(int concurrency) throws Exception {
-        Long partyId = create정원1명파티();
+    private RoundResult runRound(int concurrency, int maxPassengers) throws Exception {
+        Long partyId = create파티(maxPassengers);
         List<Long> participantIds = create대기중참여요청(partyId, concurrency);
 
         CountDownLatch ready = new CountDownLatch(concurrency);
@@ -194,11 +210,11 @@ class PartyApprovalLockBenchmarkTest {
             }
             long roundWallClockNanos = System.nanoTime() - roundStart;
 
-            // 정합성 검증 — 라운드마다
+            // 정합성 검증 — 라운드마다. concurrency >= maxPassengers이므로 항상 정원까지 채우고 마감된다.
             Party party = partyRepository.findById(partyId).orElseThrow();
-            assertThat(party.getCurrentPassengers()).isEqualTo(1);
+            assertThat(party.getCurrentPassengers()).isEqualTo(maxPassengers);
             assertThat(party.getStatus()).isEqualTo(PartyStatus.CLOSED);
-            assertThat(count승인된참여자(partyId)).isEqualTo(1);
+            assertThat(count승인된참여자(partyId)).isEqualTo(maxPassengers);
 
             return new RoundResult(outcomes, roundWallClockNanos);
         } finally {
@@ -206,7 +222,7 @@ class PartyApprovalLockBenchmarkTest {
         }
     }
 
-    private Long create정원1명파티() {
+    private Long create파티(int maxPassengers) {
         return txTemplate.execute(status -> {
             Party party = Party.create(
                     DRIVER_ID, "락 전략 벤치마크", "동시성 측정용 파티",
@@ -214,7 +230,7 @@ class PartyApprovalLockBenchmarkTest {
                     "목적지", 37.1, 127.1,
                     LocalDateTime.now().plusHours(1),
                     LocalDateTime.now().plusHours(2),
-                    1
+                    maxPassengers
             );
             return partyRepository.save(party).getId();
         });
@@ -248,7 +264,7 @@ class PartyApprovalLockBenchmarkTest {
     //  리포트 출력
     // ════════════════════════════════════════
 
-    private void printReport(int concurrency, List<RoundResult> results) {
+    private void printReport(int concurrency, int maxPassengers, List<RoundResult> results) {
         List<Outcome> all = results.stream()
                 .flatMap(round -> round.outcomes().stream())
                 .toList();
@@ -274,8 +290,8 @@ class PartyApprovalLockBenchmarkTest {
                 .average().orElse(0) / 1_000_000.0;
 
         System.out.println("========================================================");
-        System.out.printf("락 전략: %s | 동시 요청: %d건 | 라운드: %d회%n",
-                lockStrategy, concurrency, results.size());
+        System.out.printf("락 전략: %s | 정원: %d명 | 동시 요청: %d건 | 라운드: %d회%n",
+                lockStrategy, maxPassengers, concurrency, results.size());
         System.out.println("========================================================");
         System.out.printf("총 요청           : %d건%n", total);
         System.out.printf("성공률            : %d / %d (%.1f%%)%n", successes.size(), total, successRate);

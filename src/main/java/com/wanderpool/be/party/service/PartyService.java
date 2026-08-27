@@ -37,6 +37,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
@@ -45,6 +46,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class PartyService {
@@ -233,11 +235,37 @@ public class PartyService {
                 if (attempt == totalAttempts) {
                     throw e;
                 }
+                if (!hasRemainingCapacity(partyId)) {
+                    log.debug("partyId={} 재시도 스킵 — 남은 정원 없음 (attempt={}/{})",
+                            partyId, attempt, totalAttempts);
+                    throw capacityExhaustedException(partyId);
+                }
                 backoffBeforeRetry(attempt);
             }
         }
 
         throw new IllegalStateException("acceptJoinRequest 재시도 루프가 결과 없이 종료되었습니다");
+    }
+
+    /**
+     * 재시도 전에 락 없이 가볍게 재조회해서 자리가 남아있는지 확인한다. 정원 1명 완전 경쟁처럼
+     * 애초에 이길 수 있는 요청이 하나도 안 남은 상황에서는 재시도해도 성공률이 오르지 않고
+     * 패자들의 지연·DB 부하만 늘어나므로, 이 경우 재시도를 스킵한다. 재시도 여부를 판단하기
+     * 위한 참고용 스냅샷일 뿐이라 락을 걸지 않는다 — 어차피 실제 승낙 시도는
+     * PartyApprovalAttempt에서 락 전략에 맞게 다시 검증한다.
+     */
+    private boolean hasRemainingCapacity(Long partyId) {
+        Party party = partyRepository.findById(partyId)
+                .orElseThrow(() -> new PartyException(PartyErrorCode.PARTY_NOT_FOUND));
+        return party.getStatus() == PartyStatus.RECRUITING && !party.isFull();
+    }
+
+    private PartyException capacityExhaustedException(Long partyId) {
+        Party party = partyRepository.findById(partyId)
+                .orElseThrow(() -> new PartyException(PartyErrorCode.PARTY_NOT_FOUND));
+        return party.getStatus() != PartyStatus.RECRUITING
+                ? new PartyException(PartyErrorCode.PARTY_NOT_RECRUITING)
+                : new PartyException(PartyErrorCode.CAPACITY_EXCEEDED);
     }
 
     /**
