@@ -13,10 +13,10 @@ import com.wanderpool.be.party.repository.PartyRepository;
 import com.wanderpool.be.party.service.dto.PartyJoinRequest;
 import com.wanderpool.be.party.service.dto.PartyJoinResponse;
 import com.wanderpool.be.party.service.dto.PartyParticipantSummaryResponse;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -50,12 +50,27 @@ class PartyJoinServiceTest {
     @Mock
     private MemberClient memberClient;
 
-    @InjectMocks
     private PartyService partyService;
 
     private final Long driverId = 1L;
     private final Long passengerId = 2L;
     private final Long partyId = 100L;
+
+    @BeforeEach
+    void setUpPartyService() {
+        // PartyApprovalAttempt는 @Component로 분리된 별도 빈이라 @InjectMocks가 자동으로
+        // 채워주지 않으므로, 같은 mock 리포지토리로 직접 만들어 주입한다.
+        PartyApprovalAttempt partyApprovalAttempt =
+                new PartyApprovalAttempt(partyRepository, participantRepository);
+        partyService = new PartyService(
+                partyRepository,
+                participantRepository,
+                pointRefundOutboxRepository,
+                pointCreditOutboxRepository,
+                memberClient,
+                partyApprovalAttempt
+        );
+    }
 
     private Party createParty(int max) {
         Party party = Party.create(

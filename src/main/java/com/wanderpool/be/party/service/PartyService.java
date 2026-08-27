@@ -16,7 +16,6 @@ import com.wanderpool.be.party.credit.PointCreditOutbox;
 import com.wanderpool.be.party.credit.PointCreditOutboxRepository;
 import com.wanderpool.be.party.common.apiResponse.code.PartyErrorCode;
 import com.wanderpool.be.party.common.apiResponse.exception.PartyException;
-import com.wanderpool.be.party.common.apiResponse.exception.PartyNotFoundException;
 import com.wanderpool.be.party.refund.PointRefundOutbox;
 import com.wanderpool.be.party.refund.PointRefundOutboxRepository;
 import com.wanderpool.be.party.repository.PartyParticipantRepository;
@@ -36,14 +35,18 @@ import jakarta.persistence.criteria.Predicate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class PartyService {
@@ -53,10 +56,19 @@ public class PartyService {
     private final PointRefundOutboxRepository pointRefundOutboxRepository;
     private final PointCreditOutboxRepository pointCreditOutboxRepository;
     private final MemberClient memberClient;
+    private final PartyApprovalAttempt partyApprovalAttempt;
 
     /** 참여 승낙 시 동시성 제어 전략: OPTIMISTIC(기본) | PESSIMISTIC */
     @Value("${party.approval.lock-strategy:OPTIMISTIC}")
     private String lockStrategy;
+
+    /** OPTIMISTIC 전략에서 버전 충돌(OptimisticLockingFailureException) 시 재시도할 최대 횟수 */
+    @Value("${party.approval.max-retries:3}")
+    private int maxRetries;
+
+    /** 재시도 백오프 계산에 쓰이는 기준 지연(ms). 실제 대기는 시도 차수에 비례한 선형 값 + [0, 이 값) 랜덤 지터 */
+    @Value("${party.approval.retry-backoff-ms:20}")
+    private long retryBackoffMs;
 
     @Transactional
     public PartyCreateResponse createParty(Long driverMemberId, PartyCreateRequest request) {
@@ -207,29 +219,68 @@ public class PartyService {
         return PartyJoinResponse.from(participant);
     }
 
-    @Transactional
+    /**
+     * 참여 승낙. 각 시도는 PartyApprovalAttempt에서 새 트랜잭션(REQUIRES_NEW)으로 실행되며,
+     * OPTIMISTIC 전략에서 버전 충돌이 나면 실패한 트랜잭션의 stale한 영속성 컨텍스트를 버리고
+     * 다음 시도에서 최신 데이터를 다시 읽어와 재시도한다. PESSIMISTIC 전략은 애초에 락으로
+     * 충돌을 막으므로 재시도하지 않고 1회만 시도한다.
+     */
     public PartyJoinResponse acceptJoinRequest(Long partyId, Long participantId, Long driverMemberId) {
-        PartyParticipant participant = loadParticipant(partyId, participantId);
+        int totalAttempts = "OPTIMISTIC".equals(lockStrategy) ? maxRetries + 1 : 1;
 
-        // 전략 분기: 비관적이면 락을 걸고 재조회, 낙관적이면 기존 참조 사용.
-        // participant.getParty()를 먼저 건드리면(예: verifyDriver) 그 시점에 락 없이
-        // Party가 영속성 컨텍스트에 로드되어버려서, 뒤이은 findByIdForUpdate가 실제로는
-        // DB 락만 걸고 이미 캐시된(stale) 엔티티를 그대로 반환한다 — 그러면 락을 걸어도
-        // 갱신된 상태를 못 보고 그대로 버전 충돌이 난다. 그래서 락 조회를 다른 Party 접근보다 먼저 해야 한다.
-        Party party = "PESSIMISTIC".equals(lockStrategy)
-                ? partyRepository.findByIdForUpdate(partyId)
-                        .orElseThrow(PartyNotFoundException::new)
-                : participant.getParty();
-        verifyDriver(party, driverMemberId);
-
-        if (party.getStatus() != PartyStatus.RECRUITING) {
-            throw new PartyException(PartyErrorCode.PARTY_NOT_RECRUITING);
+        for (int attempt = 1; attempt <= totalAttempts; attempt++) {
+            try {
+                return partyApprovalAttempt.attempt(partyId, participantId, driverMemberId, lockStrategy);
+            } catch (OptimisticLockingFailureException e) {
+                if (attempt == totalAttempts) {
+                    throw e;
+                }
+                if (!hasRemainingCapacity(partyId)) {
+                    log.debug("partyId={} 재시도 스킵 — 남은 정원 없음 (attempt={}/{})",
+                            partyId, attempt, totalAttempts);
+                    throw capacityExhaustedException(partyId);
+                }
+                backoffBeforeRetry(attempt);
+            }
         }
 
-        participant.accept();
-        party.incrementPassengers();
+        throw new IllegalStateException("acceptJoinRequest 재시도 루프가 결과 없이 종료되었습니다");
+    }
 
-        return PartyJoinResponse.from(participant);
+    /**
+     * 재시도 전에 락 없이 가볍게 재조회해서 자리가 남아있는지 확인한다. 정원 1명 완전 경쟁처럼
+     * 애초에 이길 수 있는 요청이 하나도 안 남은 상황에서는 재시도해도 성공률이 오르지 않고
+     * 패자들의 지연·DB 부하만 늘어나므로, 이 경우 재시도를 스킵한다. 재시도 여부를 판단하기
+     * 위한 참고용 스냅샷일 뿐이라 락을 걸지 않는다 — 어차피 실제 승낙 시도는
+     * PartyApprovalAttempt에서 락 전략에 맞게 다시 검증한다.
+     */
+    private boolean hasRemainingCapacity(Long partyId) {
+        Party party = partyRepository.findById(partyId)
+                .orElseThrow(() -> new PartyException(PartyErrorCode.PARTY_NOT_FOUND));
+        return party.getStatus() == PartyStatus.RECRUITING && !party.isFull();
+    }
+
+    private PartyException capacityExhaustedException(Long partyId) {
+        Party party = partyRepository.findById(partyId)
+                .orElseThrow(() -> new PartyException(PartyErrorCode.PARTY_NOT_FOUND));
+        return party.getStatus() != PartyStatus.RECRUITING
+                ? new PartyException(PartyErrorCode.PARTY_NOT_RECRUITING)
+                : new PartyException(PartyErrorCode.CAPACITY_EXCEEDED);
+    }
+
+    /**
+     * 시도 차수에 비례한 선형 백오프 + [0, retryBackoffMs) 랜덤 지터.
+     * 지터가 없으면 동시에 충돌한 스레드들이 같은 지연 후 동시에 재시도해 다시 충돌하기 쉽다.
+     */
+    private void backoffBeforeRetry(int attempt) {
+        long linearDelayMs = attempt * retryBackoffMs;
+        long jitterMs = retryBackoffMs > 0 ? ThreadLocalRandom.current().nextLong(retryBackoffMs) : 0;
+        try {
+            Thread.sleep(linearDelayMs + jitterMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("acceptJoinRequest 재시도 대기 중 인터럽트가 발생했습니다", e);
+        }
     }
 
     @Transactional

@@ -49,7 +49,7 @@ Kong API Gateway를 통해 외부 요청을 라우팅하고 서비스별 Databas
 | Communication | REST, gRPC |
 | Database | PostgreSQL, Flyway |
 | API Docs | Springdoc OpenAPI (Swagger) |
-| Test | JUnit5, Mockito, JaCoCo |
+| Test | JUnit5, Mockito, JaCoCo, Testcontainers |
 | Build | Gradle |
 | Infra | Docker, Kubernetes |
 | CI/CD | Jenkins, GitLab CI, Harbor, Argo CD |
@@ -242,10 +242,25 @@ Member, Map 서비스와 내부 통신은 gRPC를 사용했습니다.
 대표 예외 코드
 
 - PARTY_NOT_FOUND
-- PARTY_ALREADY_CLOSED
-- DUPLICATED_PARTICIPANT
-- INVALID_PARTY_STATUS
-- DRIVER_ONLY_OPERATION
+- PARTY_NOT_RECRUITING
+- ALREADY_JOINED
+- INVALID_STATUS_TRANSITION
+- NOT_PARTY_DRIVER
+
+---
+
+### 7.6 Concurrency Control
+
+정원 마감 시점에 여러 참여 승낙 요청이 동시에 들어오면 `currentPassengers`가 정원을 초과해서 카운트될 수 있는 동시성 문제가 있어, `Party`에 `@Version` 컬럼을 추가하고 `party.approval.lock-strategy` 프로퍼티로 낙관적 락(`OPTIMISTIC`, 기본값) / 비관적 락(`PESSIMISTIC`, `SELECT ... FOR UPDATE`) 중 하나를 선택할 수 있게 했습니다.
+
+두 전략의 실제 효과는 Testcontainers 기반 벤치마크(`PartyApprovalLockBenchmarkTest`, 정원 1명 파티에 동시 요청 2/8/32건 × 15라운드)로 직접 측정해서 검증했습니다. 이 과정에서 `PESSIMISTIC` 전략이 실제로는 버전 충돌을 줄이지 못하는 버그를 발견했습니다 — `Party` 엔티티가 락 조회 이전에 다른 코드 경로(`verifyDriver`)에서 락 없이 먼저 영속성 컨텍스트에 로드돼버리면, Hibernate가 이미 관리 중인 엔티티를 이후 락 쿼리 결과로 덮어쓰지 않기 때문에 DB 락은 걸려도 애플리케이션은 stale 상태를 그대로 쓰게 되는 문제였습니다. `Party`에 대한 첫 접근이 락 조회 자체가 되도록 순서를 수정한 뒤 재측정해서, 모든 동시성 구간에서 버전 충돌이 0건이 되는 것을 확인했습니다. 상세 원인 분석과 참고 문서는 [PR #1](https://github.com/Wooniq/wanderpool-party/pull/1)에 정리했습니다.
+
+`OPTIMISTIC` 전략은 버전 충돌이 나면 그대로 실패하는 대신, `party.approval.max-retries`(기본 3) 회까지 재시도합니다. 재시도는 실패한 트랜잭션의 stale한 영속성 컨텍스트를 재사용하지 않도록 매번 새 트랜잭션(`PartyApprovalAttempt#attempt`, `REQUIRES_NEW`)에서 최신 데이터를 다시 읽어오며, 시도마다 `party.approval.retry-backoff-ms` 기준 선형 증가 + 랜덤 지터를 백오프로 둡니다(동시 재시도가 다시 충돌하는 걸 완화하기 위함).
+
+다만 정원 1명 완전 경쟁처럼 애초에 이길 수 있는 요청이 하나도 안 남은 상황에서는, 무조건 재시도하는 게 패자들의 지연과 DB 부하만 늘릴 뿐 성공률을 전혀 못 올린다는 게 벤치마크로 확인됐습니다. 그래서 재시도 직전에 `PartyRepository.findById`로 Party를 락 없이 가볍게 재조회해서, 이미 마감됐거나(`status != RECRUITING`) 남은 자리가 없으면(`hasRemainingCapacity` == false) 재시도를 스킵하고 즉시 `CAPACITY_EXCEEDED`/`PARTY_NOT_RECRUITING`으로 실패 처리합니다. 실측 결과:
+
+- **정원 1명 × 동시 요청 2/8/32건(완전 경쟁)**: 스킵 로직 도입 전후로 성공률은 동일(각 50.0% / 12.5% / 3.1%, CONFLICT 0건)하지만, 라운드 평균 wall-clock은 32건 기준 73.7ms → 36.8ms로 절반 가까이 줄었습니다(재시도 도입 전 `PESSIMISTIC` 실측치 45.1ms와 비슷하거나 더 빠른 수준) — 재시도가 스킵되면서 재시도 도입 전의 저지연 특성이 그대로 재현된 것입니다.
+- **정원 5명 × 동시 요청 32건(여유 경쟁)**: `max-retries=3`(기본값)에서는 15라운드 모두 정확히 5명씩(총 75/480, 15.6%) 채워지고 CONFLICT/ERROR는 0건입니다. 같은 시나리오를 `max-retries=0`(재시도 없음)으로 재실행하면 일부 라운드에서 5자리 중 2자리만 채워진 채 끝나는 걸 실제로 확인했습니다 — 자리가 남아있는데도 재시도를 안 하면 정원을 다 못 채우는 사례가 재현된다는 뜻이며, 재시도가 실제로 성공률을 끌어올리는 시나리오라는 걸 이 비교로 검증했습니다. (단, `OPTIMISTIC`의 wall-clock(133.6ms)이 `PESSIMISTIC`(67.3ms)보다 큰데, 슬롯을 하나씩 채울 때마다 재시도·백오프가 반복되기 때문입니다 — 여유 경쟁에서는 처리량보다 지연 비용이 더 드러납니다.)
 
 ---
 
@@ -277,6 +292,7 @@ Swagger(OpenAPI)를 기준으로 관리합니다.
 - Repository Test
 - JaCoCo Coverage Verification
 - gRPC Client Mock Test
+- Concurrency Benchmark Test (Testcontainers + PostgreSQL, 락 전략별 동시 요청 부하 측정)
 
 ```bash
 ./gradlew test
@@ -302,6 +318,30 @@ ArgoCD --> Kubernetes
 ---
 
 ## 11. Run
+
+### Prerequisites
+
+이 서비스는 사내 공통 모듈(`com.wanderpool:common`, `com.wanderpool:grpc-contract`)에 의존합니다. 팀 내부에서는 GitLab Maven Registry에서 자동으로 받아오지만, 외부에서 이 저장소만 클론해서 빌드하는 경우 아래 둘 중 하나가 필요합니다.
+
+- GitLab Maven 접근 권한이 있는 경우: `-PgitLabMavenUrl=<url> -PgitLabMavenToken=<token>` 옵션으로 빌드
+- 없는 경우: [wanderpool-common](https://github.com/Mobility-SW-School-3rd-Cloud/wanderpool-common), [wanderpool-proto](https://github.com/Mobility-SW-School-3rd-Cloud/wanderpool-proto)를 각각 클론해서 `./gradlew publishToMavenLocal`로 로컬 Maven 저장소에 먼저 설치
+
+또한 Java 21 (Gradle 툴체인)이 필요합니다. 기본 프로필은 H2 인메모리 DB로 별도 설정 없이 바로 실행되며, PostgreSQL은 운영 환경 연동 시(datasource 환경변수 재정의) 또는 `PartyApprovalLockBenchmarkTest` 동시성 벤치마크 실행 시(Docker 기반 Testcontainers)에만 필요합니다. 아래 환경변수는 필요 시 재정의할 수 있습니다 (`application.yaml` 기준, 기본값은 괄호 안).
+
+| 환경변수 | 설명 |
+|---|---|
+| `PARTY_SERVER_PORT` | HTTP 서버 포트 (`8083`) |
+| `PARTY_GRPC_PORT` | gRPC 서버 포트 (`9091`) |
+| `PARTY_DATASOURCE_URL` | DB 접속 URL (`jdbc:h2:mem:party`) |
+| `PARTY_DATASOURCE_USERNAME` / `PARTY_DATASOURCE_PASSWORD` | DB 계정 (`sa` / 빈 값) |
+| `PARTY_JPA_DDL_AUTO` | Hibernate DDL 전략 (`validate`) |
+| `PARTY_MEMBER_CLIENT_TYPE` | Member 서비스 연동 방식 (`grpc`) |
+| `PARTY_MEMBER_CLIENT_TIMEOUT_MS` | Member 서비스 호출 타임아웃 ms (`500`) |
+| `PARTY_MEMBER_CLIENT_INTERNAL_TOKEN` | 내부 서비스 간 인증 토큰 |
+| `MEMBER_GRPC_HOST` / `MEMBER_GRPC_PORT` | Member 서비스 gRPC 주소 (`localhost` / `9093`) |
+| `PARTY_APPROVAL_LOCK_STRATEGY` | 참여 승낙 동시성 제어 전략 — `OPTIMISTIC`(기본) / `PESSIMISTIC` |
+| `PARTY_APPROVAL_MAX_RETRIES` | `OPTIMISTIC` 전략에서 버전 충돌 시 재시도 최대 횟수 (`3`, `PESSIMISTIC`에서는 사용 안 함) |
+| `PARTY_APPROVAL_RETRY_BACKOFF_MS` | 재시도 백오프 기준 ms — 선형 증가분 단위 + 지터 상한 (`20`) |
 
 ### Local
 
